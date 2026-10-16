@@ -1,0 +1,104 @@
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        AWS_ACCOUNT_ID = '344872153789'
+        ECR_REPOSITORY = 'devops-automation'
+        ECR_REGISTRY   = '344872153789.dkr.ecr.us-east-1.amazonaws.com'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate Application') {
+            steps {
+                sh '''
+                    set -eu
+                    test -f app/index.html
+                    test -f docker/Dockerfile
+                    test -f scripts/validate.sh
+                    echo "Required application files are present."
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    env.IMAGE_TAG = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+
+                sh '''
+                    set -eu
+                    chmod +x scripts/validate.sh
+                    CI_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+                        ./scripts/validate.sh
+                '''
+            }
+        }
+
+        stage('Push Image to ECR') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh '''
+                    set -eu
+
+                    aws sts get-caller-identity
+
+                    aws ecr get-login-password --region "$AWS_REGION" |
+                        docker login \
+                            --username AWS \
+                            --password-stdin "$ECR_REGISTRY"
+
+                    docker push \
+                        "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+                '''
+            }
+        }
+
+        stage('Trigger CD Pipeline') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                build job: 'DevOps-CD',
+                    wait: true,
+                    parameters: [
+                        string(
+                            name: 'IMAGE_TAG',
+                            value: env.IMAGE_TAG
+                        )
+                    ]
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'CI completed successfully.'
+        }
+
+        failure {
+            echo 'CI failed. Check the stage logs.'
+        }
+    }
+}
+

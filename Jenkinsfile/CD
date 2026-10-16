@@ -1,0 +1,95 @@
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'Exact Docker image tag produced by CI'
+        )
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        ECR_REGISTRY   = '344872153789.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_REPOSITORY = 'devops-automation'
+        APP_HOST       = '35.175.110.123'
+        SSH_CREDENTIAL_ID = 'app-server-ssh'
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!(params.IMAGE_TAG ==~ /^[a-f0-9]+$/)) {
+                        error('IMAGE_TAG must be the Git commit tag supplied by CI.')
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Application EC2') {
+            steps {
+                sshagent(credentials: [env.SSH_CREDENTIAL_ID]) {
+                    sh '''
+                        set -eu
+
+                        IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+                        ssh -o StrictHostKeyChecking=accept-new \
+                            ubuntu@"$APP_HOST" \
+                            "AWS_REGION='$AWS_REGION' \
+                             ECR_REGISTRY='$ECR_REGISTRY' \
+                             IMAGE='$IMAGE' bash -s" <<'REMOTE'
+                        set -eu
+
+                        aws ecr get-login-password --region "$AWS_REGION" |
+                            sudo docker login \
+                                --username AWS \
+                                --password-stdin "$ECR_REGISTRY"
+
+                        sudo docker pull "$IMAGE"
+
+                        sudo docker rm -f devops-platform 2>/dev/null || true
+
+                        sudo docker run -d \
+                            --name devops-platform \
+                            --restart unless-stopped \
+                            -p 8081:80 \
+                            "$IMAGE"
+
+                        for attempt in $(seq 1 12); do
+                            if curl -fsS http://localhost:8081/ >/dev/null; then
+                                echo "Deployment successful."
+                                exit 0
+                            fi
+                            sleep 5
+                        done
+
+                        echo "Application health check failed."
+                        sudo docker logs devops-platform
+                        exit 1
+REMOTE
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'CD completed successfully.'
+        }
+
+        failure {
+            echo 'CD failed. Check SSH, ECR permissions, Docker and application logs.'
+        }
+    }
+}
+
